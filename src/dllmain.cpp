@@ -4,6 +4,7 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <safetyhook.hpp>
+#include <chrono>
 
 HMODULE baseModule = GetModuleHandle(NULL);
 HMODULE thisModule;
@@ -437,38 +438,61 @@ void Framerate()
             spdlog::error("Unlock Framerate: Pattern scan failed.");
         }
 
-        // Menu cursor speed
+        // Menu input repeat speed
         // List menus (mithril::menu::UnitUIHudSetControlBase and derived, e.g. UnitUIHudSetItemCategory)
-        // block the next move until a highlight-slide animation reaches its target: each frame the
-        // position ([rdi+0x70]) advances toward the target ([rdi+0x7c]) by a per-frame amount
-        // ([rdi+0x18]), and the busy flag ([rdi+0x60]) is only cleared - unlocking the next input -
-        // once the target is reached. That frame count is framerate-independent, so at high
-        // framerates the slide completes in proportionally less wall-clock time and menu inputs
-        // repeat too quickly. Scale the per-frame advance by the frametime ratio (1.0 @ 30fps,
-        // 0.25 @ 120fps) so the slide - and therefore the input repeat rate - keeps a constant
-        // wall-clock duration regardless of framerate.
-        uint8_t* MenuCursorSpeedScanResult = Memory::PatternScan(baseModule, "F3 0F 10 47 70 0F 2F 47 7C 72 ?? 83 7F 68 00 C7 47 60 00 00 00 00");
-        if (MenuCursorSpeedScanResult)
+        // run a per-frame update (WOFF+0x140811260) that each frame asks a "move gate" whether the
+        // cursor should advance and, if so, applies the move. That decision is frame-based, so under
+        // Unlock Framerate the update runs at the rendered framerate and the cursor repeats
+        // proportionally too fast. Throttle the accepted moves to a fixed wall-clock cadence (matching
+        // the ~6-frames-at-30fps vanilla repeat) so held-direction repeats stay framerate-independent.
+        // A fresh press (the object's held flag at +0x748 rising 0->1) is always let through, so
+        // distinct taps are never dropped - only auto-repeat is rate-limited. The hook sits right
+        // after the move-gate call, at "cmp [rax],0" where rax = &moveResult and rdi = the menu
+        // object; zeroing moveResult suppresses the move for that frame (a no-move frame is the
+        // common case, so it is safe). This deliberately does NOT touch the generic UI animation
+        // updater (WOFF+0xb6e470) - scaling that broke the title screen in an earlier attempt.
+        uint8_t* MenuInputRepeatScanResult = Memory::PatternScan(baseModule, "83 38 00 74 12 48 8B CF E8 ?? ?? ?? ?? C7 87 D0 02 00 00 01 00 00 00");
+        if (MenuInputRepeatScanResult)
         {
-            spdlog::info("Unlock Framerate: Menu Cursor Speed: Address is {:s}+{:x}", sExeName.c_str(), (uintptr_t)MenuCursorSpeedScanResult - (uintptr_t)baseModule);
+            spdlog::info("Unlock Framerate: Menu Input Repeat: Address is {:s}+{:x}", sExeName.c_str(), (uintptr_t)MenuInputRepeatScanResult - (uintptr_t)baseModule);
 
-            static SafetyHookMid MenuCursorSpeedMidHook{};
-            MenuCursorSpeedMidHook = safetyhook::create_mid(MenuCursorSpeedScanResult + 0x29,
+            static SafetyHookMid MenuInputRepeatMidHook{};
+            MenuInputRepeatMidHook = safetyhook::create_mid(MenuInputRepeatScanResult,
                 [](SafetyHookContext& ctx)
                 {
-                    // The hooked instruction is "addss xmm0, [rdi+0x18]" (advance += step).
-                    // Pre-bias xmm0 so that after the original add the net advance is step * scale.
-                    if (fCurrentFrametime > 0.0f)
+                    // Minimum wall-clock gap between accepted auto-repeat moves. Vanilla repeats
+                    // every ~6 frames at 30fps (~0.2s); use a hair less so we never throttle at or
+                    // below 30fps and only rate-limit the extra moves higher framerates introduce.
+                    using clock = std::chrono::steady_clock;
+                    static constexpr auto kRepeatInterval = std::chrono::milliseconds(180);
+                    static bool bPrevHeld = false;
+                    static clock::time_point tpLastMove{};
+
+                    if (ctx.rax == 0 || ctx.rdi == 0)
+                        return;
+
+                    const auto now = clock::now();
+
+                    // Held flag: 1 while a direction is held, 0 when released. A 0->1 rising edge is a
+                    // fresh press, so arm the timer to let that first move through without delay.
+                    const bool bHeld = *reinterpret_cast<int*>(ctx.rdi + 0x748) != 0;
+                    if (bHeld && !bPrevHeld)
+                        tpLastMove = clock::time_point{};
+                    bPrevHeld = bHeld;
+
+                    // moveResult != 0 means the game wants to advance the cursor this frame.
+                    if (*reinterpret_cast<int*>(ctx.rax) != 0)
                     {
-                        float fStep = *reinterpret_cast<float*>(ctx.rdi + 0x18);
-                        float fScale = fCurrentFrametime * 30.0f / 1000.0f; // 1.0 @ 30fps, 0.25 @ 120fps
-                        ctx.xmm0.f32[0] += fStep * (fScale - 1.0f);
+                        if (now - tpLastMove >= kRepeatInterval)
+                            tpLastMove = now;                       // accept this move
+                        else
+                            *reinterpret_cast<int*>(ctx.rax) = 0;   // suppress the too-fast repeat
                     }
                 });
         }
-        else if (!MenuCursorSpeedScanResult)
+        else if (!MenuInputRepeatScanResult)
         {
-            spdlog::error("Unlock Framerate: Menu Cursor Speed: Pattern scan failed.");
+            spdlog::error("Unlock Framerate: Menu Input Repeat: Pattern scan failed.");
         }
     }
 }
