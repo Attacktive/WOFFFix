@@ -436,6 +436,40 @@ void Framerate()
         {
             spdlog::error("Unlock Framerate: Pattern scan failed.");
         }
+
+        // Menu cursor speed
+        // List menus (mithril::menu::UnitUIHudSetControlBase and derived, e.g. UnitUIHudSetItemCategory)
+        // block the next move until a highlight-slide animation reaches its target: each frame the
+        // position ([rdi+0x70]) advances toward the target ([rdi+0x7c]) by a per-frame amount
+        // ([rdi+0x18]), and the busy flag ([rdi+0x60]) is only cleared - unlocking the next input -
+        // once the target is reached. That frame count is framerate-independent, so at high
+        // framerates the slide completes in proportionally less wall-clock time and menu inputs
+        // repeat too quickly. Scale the per-frame advance by the frametime ratio (1.0 @ 30fps,
+        // 0.25 @ 120fps) so the slide - and therefore the input repeat rate - keeps a constant
+        // wall-clock duration regardless of framerate.
+        uint8_t* MenuCursorSpeedScanResult = Memory::PatternScan(baseModule, "F3 0F 10 47 70 0F 2F 47 7C 72 ?? 83 7F 68 00 C7 47 60 00 00 00 00");
+        if (MenuCursorSpeedScanResult)
+        {
+            spdlog::info("Unlock Framerate: Menu Cursor Speed: Address is {:s}+{:x}", sExeName.c_str(), (uintptr_t)MenuCursorSpeedScanResult - (uintptr_t)baseModule);
+
+            static SafetyHookMid MenuCursorSpeedMidHook{};
+            MenuCursorSpeedMidHook = safetyhook::create_mid(MenuCursorSpeedScanResult + 0x29,
+                [](SafetyHookContext& ctx)
+                {
+                    // The hooked instruction is "addss xmm0, [rdi+0x18]" (advance += step).
+                    // Pre-bias xmm0 so that after the original add the net advance is step * scale.
+                    if (fCurrentFrametime > 0.0f)
+                    {
+                        float fStep = *reinterpret_cast<float*>(ctx.rdi + 0x18);
+                        float fScale = fCurrentFrametime * 30.0f / 1000.0f; // 1.0 @ 30fps, 0.25 @ 120fps
+                        ctx.xmm0.f32[0] += fStep * (fScale - 1.0f);
+                    }
+                });
+        }
+        else if (!MenuCursorSpeedScanResult)
+        {
+            spdlog::error("Unlock Framerate: Menu Cursor Speed: Pattern scan failed.");
+        }
     }
 }
 
