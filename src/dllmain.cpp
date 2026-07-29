@@ -5,6 +5,7 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <safetyhook.hpp>
 #include <chrono>
+#include <unordered_map>
 
 HMODULE baseModule = GetModuleHandle(NULL);
 HMODULE thisModule;
@@ -465,26 +466,39 @@ void Framerate()
                     // below 30fps and only rate-limit the extra moves higher framerates introduce.
                     using clock = std::chrono::steady_clock;
                     static constexpr auto kRepeatInterval = std::chrono::milliseconds(180);
-                    static bool bPrevHeld = false;
-                    static clock::time_point tpLastMove{};
+
+                    // This update runs once per active menu/list object (keyed by rdi) per frame, and
+                    // a single menu screen commonly has several such objects live at once (list box,
+                    // category headers, sub-lists, ...). A single shared state machine across all of
+                    // them caused their held/not-held transitions to stomp on each other and made the
+                    // suppress/allow decision flip erratically the instant more than one object was on
+                    // screen - visible as flicker whenever a menu appeared. Keying by object pointer
+                    // isolates each object's repeat timing from the others.
+                    struct RepeatState
+                    {
+                        clock::time_point tpLastMove{};
+                        bool bPrevHeld = false;
+                    };
+                    static std::unordered_map<uintptr_t, RepeatState> states;
 
                     if (ctx.rax == 0 || ctx.rdi == 0)
                         return;
 
                     const auto now = clock::now();
+                    RepeatState& state = states[ctx.rdi];
 
                     // Held flag: 1 while a direction is held, 0 when released. A 0->1 rising edge is a
                     // fresh press, so arm the timer to let that first move through without delay.
                     const bool bHeld = *reinterpret_cast<int*>(ctx.rdi + 0x748) != 0;
-                    if (bHeld && !bPrevHeld)
-                        tpLastMove = clock::time_point{};
-                    bPrevHeld = bHeld;
+                    if (bHeld && !state.bPrevHeld)
+                        state.tpLastMove = clock::time_point{};
+                    state.bPrevHeld = bHeld;
 
                     // moveResult != 0 means the game wants to advance the cursor this frame.
                     if (*reinterpret_cast<int*>(ctx.rax) != 0)
                     {
-                        if (now - tpLastMove >= kRepeatInterval)
-                            tpLastMove = now;                       // accept this move
+                        if (now - state.tpLastMove >= kRepeatInterval)
+                            state.tpLastMove = now;                 // accept this move
                         else
                             *reinterpret_cast<int*>(ctx.rax) = 0;   // suppress the too-fast repeat
                     }
